@@ -32,6 +32,7 @@ import json
 import hashlib
 import socket
 import platform
+import re
 
 from mem0 import Memory
 from app.database import SessionLocal
@@ -136,12 +137,33 @@ def reset_memory_client():
 
 def get_default_memory_config():
     """Get default memory client configuration with sensible defaults."""
+    # Get Qdrant host from environment variable, fallback to mem0_store
+    qdrant_host = "mem0_store"  # Default fallback
+    
+    qdrant_host_env = os.environ.get("QDRANT_HOST")
+    if qdrant_host_env:
+        # Parse host from URL if it contains protocol, otherwise use as-is
+        if "://" in qdrant_host_env:
+            # Extract hostname from URL like "http://qdrant:6333"
+            match = re.search(r'://([^:]+)', qdrant_host_env)
+            if match:
+                qdrant_host = match.group(1)
+                print(f"[DEBUG] Parsed Qdrant host from QDRANT_HOST URL: {qdrant_host}")
+            else:
+                print(f"[DEBUG] Could not parse host from QDRANT_HOST: {qdrant_host_env}, using default")
+        else:
+            # Use as-is if it's just a hostname
+            qdrant_host = qdrant_host_env
+            print(f"[DEBUG] Using QDRANT_HOST as hostname: {qdrant_host}")
+    else:
+        print(f"[DEBUG] QDRANT_HOST not found, using default host: {qdrant_host}")
+    
     return {
         "vector_store": {
             "provider": "qdrant",
             "config": {
                 "collection_name": "openmemory",
-                "host": "mem0_store",
+                "host": qdrant_host,
                 "port": 6333,
             }
         },

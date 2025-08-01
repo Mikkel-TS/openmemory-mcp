@@ -11,6 +11,7 @@ services:
     environment:
       - USER
       - API_KEY
+      - QDRANT_HOST=qdrant
     env_file:
       - api/.env
     depends_on:
