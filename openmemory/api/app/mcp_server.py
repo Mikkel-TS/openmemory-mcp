@@ -74,7 +74,7 @@ def get_user_id_from_metadata(metadata):
     Returns: user_id string or None if not found
     """
     if isinstance(metadata, dict) and "conversationId" in metadata:
-        user_id = metadata["conversationId"]
+        user_id = metadata["assistantId"]
         logging.info(f"Extracted user_id from conversationId: {user_id}")
         return user_id
     return None
@@ -143,9 +143,24 @@ async def add_memories(text: str, metadata: Any = None, agent_id: Optional[str] 
             if agent_id:
                 add_params["agent_id"] = agent_id
                 
+            # Override memory extraction prompt based on detected agent type
+            # detected_agent_type = detect_agent_type_from_metadata(metadata)
+            # agent_prompt = get_memory_extraction_prompt(detected_agent_type)
+            
+            # Temporarily override the memory client's extraction prompt
+            # original_prompt = getattr(memory_client.config, 'custom_fact_extraction_prompt', None)
+            # memory_client.config.custom_fact_extraction_prompt = agent_prompt
+            
+            # print(f"[DEBUG] Using {detected_agent_type} extraction prompt")
+            # logging.info(f"Agent type detected: {detected_agent_type}")
+                
             # Use user_id (and optionally agent_id) for memory client operations
             # Note: text is passed as first positional argument, not as keyword
             response = memory_client.add(text, **add_params)
+            
+            # Restore original prompt
+            # if original_prompt:
+            #     memory_client.config.custom_fact_extraction_prompt = original_prompt
             
             print(f"[DEBUG] memory_client.add response: {response}")
             logging.info(f"Memory client response: {response}")
@@ -207,15 +222,24 @@ async def add_memories(text: str, metadata: Any = None, agent_id: Optional[str] 
 
 @mcp.tool(description="Search through stored memories. This method is called EVERYTIME the user asks anything.")
 async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str] = None) -> str:
-    user_id = get_user_id_from_metadata(metadata)
+    # Validate metadata presence
+    if not isinstance(metadata, dict):
+        return "Error: metadata must be a dictionary containing assistantId and collectionName"
+    
+    # Extract and validate required fields
+    user_id = metadata.get("assistantId")
+    collection_name = metadata.get("collectionName")
     client_name = client_name_var.get(None)
     
+    # Validate required fields
     if not user_id:
-        return "Error: user_id not found in metadata.conversationId"
+        return "Error: assistantId not found in metadata - required for filtering"
+    if not collection_name:
+        return "Error: collectionName not found in metadata - required for filtering"
     if not client_name:
         return "Error: client_name not provided"
 
-    logging.info(f"search_memory called with query='{query}', user_id={user_id}, agent_id={agent_id}")
+    logging.info(f"search_memory called with query='{query}', user_id={user_id}, collection_name={collection_name}, agent_id={agent_id}")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
@@ -232,8 +256,11 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
             accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
             
-            # Base conditions for Qdrant search
-            conditions = [qdrant_models.FieldCondition(key="user_id", match=qdrant_models.MatchValue(value=user_id))]
+            # Base conditions for Qdrant search - UPDATED with collectionName filtering
+            conditions = [
+                qdrant_models.FieldCondition(key="user_id", match=qdrant_models.MatchValue(value=user_id)),
+                qdrant_models.FieldCondition(key="collectionName", match=qdrant_models.MatchValue(value=collection_name))
+            ]
             
             # Add agent_id condition if provided
             if agent_id:
@@ -264,6 +291,7 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
                     "created_at": memory.payload.get("created_at"),
                     "updated_at": memory.payload.get("updated_at"),
                     "score": memory.score,
+                    "collection_name": memory.payload.get("collectionName", ""),
                 }
                 for memory in memories
             ]
@@ -282,6 +310,7 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
                             metadata_={
                                 "query": query,
                                 "agent_id": agent_id,
+                                "collection_name": collection_name,
                                 "score": memory_data.get('score'),
                                 "hash": memory_data.get('hash')
                             }
@@ -299,12 +328,15 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
                         metadata_={
                             "query": query,
                             "agent_id": agent_id,
+                            "collection_name": collection_name,
                             "score": memory.get('score'),
                             "hash": memory.get('hash')
                         }
                     )
                     db.add(access_log)
                 db.commit()
+            
+            logging.info(f"Search returned {len(memories)} memories for collection '{collection_name}' and user '{user_id}'")
             return json.dumps(memories, indent=2)
         finally:
             db.close()
@@ -315,15 +347,24 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
 
 @mcp.tool(description="List all memories in the user's memory")
 async def list_memories(metadata: Any = None, agent_id: Optional[str] = None) -> str:
-    user_id = get_user_id_from_metadata(metadata)
+    # Validate metadata presence
+    if not isinstance(metadata, dict):
+        return "Error: metadata must be a dictionary containing assistantId and collectionName"
+    
+    # Extract and validate required fields
+    user_id = metadata.get("assistantId")
+    collection_name = metadata.get("collectionName")
     client_name = client_name_var.get(None)
     
+    # Validate required fields
     if not user_id:
-        return "Error: user_id not found in metadata.conversationId"
+        return "Error: assistantId not found in metadata - required for filtering"
+    if not collection_name:
+        return "Error: collectionName not found in metadata - required for filtering"
     if not client_name:
         return "Error: client_name not provided"
 
-    logging.info(f"list_memories called with user_id={user_id}, agent_id={agent_id}")
+    logging.info(f"list_memories called with user_id={user_id}, collection_name={collection_name}, agent_id={agent_id}")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
@@ -336,8 +377,11 @@ async def list_memories(metadata: Any = None, agent_id: Optional[str] = None) ->
             # Get or create user and app
             user, app = get_user_and_app(db, user_id=user_id, app_id=client_name)
 
-            # Prepare parameters for get_all
-            get_all_params = {"user_id": user_id}
+            # Prepare parameters for get_all with collectionName filtering
+            get_all_params = {
+                "user_id": user_id,
+                "metadata": {"collectionName": collection_name}
+            }
             if agent_id:
                 get_all_params["agent_id"] = agent_id
 
@@ -360,6 +404,7 @@ async def list_memories(metadata: Any = None, agent_id: Optional[str] = None) ->
                                 access_type="list",
                                 metadata_={
                                     "agent_id": agent_id,
+                                    "collection_name": collection_name,
                                     "hash": memory_data.get('hash')
                                 }
                             )
@@ -378,12 +423,15 @@ async def list_memories(metadata: Any = None, agent_id: Optional[str] = None) ->
                             access_type="list",
                             metadata_={
                                 "agent_id": agent_id,
+                                "collection_name": collection_name,
                                 "hash": memory.get('hash')
                             }
                         )
                         db.add(access_log)
                         filtered_memories.append(memory)
                 db.commit()
+            
+            logging.info(f"Listed {len(filtered_memories)} memories for collection '{collection_name}' and user '{user_id}'")
             return json.dumps(filtered_memories, indent=2)
         finally:
             db.close()

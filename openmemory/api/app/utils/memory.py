@@ -37,6 +37,7 @@ import re
 from mem0 import Memory
 from app.database import SessionLocal
 from app.models import Config as ConfigModel
+from app.utils.prompts import FACT_RETRIEVAL_PROMPT
 
 
 _memory_client = None
@@ -279,6 +280,12 @@ def get_memory_client(custom_instructions: str = None):
         instructions_to_use = custom_instructions or db_custom_instructions
         if instructions_to_use:
             config["custom_fact_extraction_prompt"] = instructions_to_use
+        else:
+            # Smart agent-aware prompt selection
+            # This function needs metadata to detect agent type, but we don't have it here
+            # So we'll use a default business prompt and let the MCP server override this
+            config["custom_fact_extraction_prompt"] = FACT_RETRIEVAL_PROMPT
+            print("Using general business memory extraction prompt (will be overridden by agent-specific detection)")
 
         # ALWAYS parse environment variables in the final config
         # This ensures that even default config values like "env:OPENAI_API_KEY" get parsed
