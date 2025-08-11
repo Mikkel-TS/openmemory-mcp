@@ -16,8 +16,10 @@ Key features:
 """
 
 import logging
+import asyncio
 import json
 from mcp.server.fastmcp import FastMCP
+import time
 from mcp.server.sse import SseServerTransport
 from app.utils.memory import get_memory_client
 from fastapi import FastAPI, Request
@@ -41,12 +43,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-print("[DEBUG] MCP Server starting up...")
+logger.debug("MCP Server starting up...")
 logger.info("MCP Server module loaded")
 
 # Initialize MCP
 mcp = FastMCP("mem0-mcp-server")
-print("[DEBUG] FastMCP initialized")
+logger.debug("FastMCP initialized")
 
 # Don't initialize memory client at import time - do it lazily when needed
 def get_memory_client_safe():
@@ -79,6 +81,89 @@ def get_user_id_from_metadata(metadata):
         return user_id
     return None
 
+async def _process_add_memories(
+    text: str,
+    full_meta: Dict[str, Any],
+    agent_id: Optional[str],
+    user_id: str,
+    client_name: str,
+    original_metadata: Dict[str, Any],
+):
+    """Background task to perform add_memories work without blocking SSE."""
+    try:
+        memory_client = get_memory_client_safe()
+        if not memory_client:
+            logging.error("Background add_memories: memory client unavailable")
+            return
+
+        db = SessionLocal()
+        try:
+            user, app = get_user_and_app(db, user_id=user_id, app_id=client_name)
+            if not app.is_active:
+                logging.warning(f"Background add_memories: app {app.name} is paused; skipping")
+                return
+
+            add_params: Dict[str, Any] = {
+                "user_id": user_id,
+                "metadata": full_meta,
+            }
+            if agent_id:
+                add_params["agent_id"] = agent_id
+
+            logging.debug("Starting memory_client.add call (background)")
+            add_start = time.perf_counter()
+            try:
+                response = await asyncio.to_thread(memory_client.add, text, **add_params)
+            finally:
+                logging.debug(
+                    f"memory_client.add (background) completed in {time.perf_counter() - add_start:.3f}s"
+                )
+
+            logging.debug(f"memory_client.add (background) response: {response}")
+
+            if isinstance(response, dict) and 'results' in response:
+                for result in response['results']:
+                    mem_id = uuid.UUID(result['id'])
+                    memory = db.query(Memory).filter(Memory.id == mem_id).first()
+                    if result['event'] == 'ADD':
+                        if not memory:
+                            memory = Memory(
+                                id=mem_id,
+                                user_id=user.id,
+                                app_id=app.id,
+                                content=result['memory'],
+                                state=MemoryState.active,
+                                metadata_=original_metadata,
+                            )
+                            db.add(memory)
+                        else:
+                            memory.state = MemoryState.active
+                            memory.content = result['memory']
+                            memory.metadata_ = original_metadata
+                        history = MemoryStatusHistory(
+                            memory_id=mem_id,
+                            changed_by=user.id,
+                            old_state=(MemoryState.deleted if memory else None),
+                            new_state=MemoryState.active,
+                        )
+                        db.add(history)
+                    elif result['event'] == 'DELETE':
+                        if memory:
+                            memory.state = MemoryState.deleted
+                            memory.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                            history = MemoryStatusHistory(
+                                memory_id=mem_id,
+                                changed_by=user.id,
+                                old_state=MemoryState.active,
+                                new_state=MemoryState.deleted,
+                            )
+                            db.add(history)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as bg_exc:
+        logging.exception(f"Background add_memories failed: {bg_exc}")
+
 @mcp.tool(description="Add a new memory, with optional user metadata and agent support.")
 async def add_memories(text: str, metadata: Any = None, agent_id: Optional[str] = None) -> str:
     """
@@ -95,8 +180,8 @@ async def add_memories(text: str, metadata: Any = None, agent_id: Optional[str] 
     user_id = get_user_id_from_metadata(metadata)
     client_name = client_name_var.get(None)
     
-    # DEBUG: Log all input parameters
-    logging.info(f"add_memories called with text='{text}', metadata={metadata}, user_id={user_id}, client_name={client_name}, agent_id={agent_id}")
+    # Debug inputs
+    logging.debug(f"add_memories called with text length={len(text) if isinstance(text, str) else 'n/a'}, metadata_keys={list(metadata.keys()) if isinstance(metadata, dict) else 'n/a'}, user_id={user_id}, client_name={client_name}, agent_id={agent_id}")
     
     if not user_id:
         return "Error: user_id not found in metadata.conversationId"
@@ -107,9 +192,9 @@ async def add_memories(text: str, metadata: Any = None, agent_id: Optional[str] 
     if not memory_client:
         return "Error: Memory system is currently unavailable. Please try again later."
 
-    print(f"[DEBUG] metadata after processing: {metadata}")
-    print(f"[DEBUG] Using user_id: {user_id}")
-    print(f"[DEBUG] Using agent_id: {agent_id}")
+    logger.debug(f"metadata after processing: {metadata}")
+    logger.debug(f"Using user_id: {user_id}")
+    logger.debug(f"Using agent_id: {agent_id}")
     
     # Merge default metadata
     full_meta = {
@@ -122,102 +207,24 @@ async def add_memories(text: str, metadata: Any = None, agent_id: Optional[str] 
     if agent_id:
         full_meta["agent_id"] = agent_id
     
-    print(f"[DEBUG] full_meta to be sent to memory_client: {full_meta}")
-    logging.info(f"Full metadata being sent: {full_meta}")
+    logger.debug(f"full_meta to be sent to memory_client: {full_meta}")
 
     try:
-        db = SessionLocal()
-        try:
-            # Use the user_id from metadata for database operations
-            user, app = get_user_and_app(db, user_id=user_id, app_id=client_name)
-            if not app.is_active:
-                return f"Error: App {app.name} is currently paused. Cannot create new memories."
-
-            # Prepare memory_client.add parameters
-            add_params = {
-                "user_id": user_id,
-                "metadata": full_meta
-            }
-            
-            # Add agent_id if provided
-            if agent_id:
-                add_params["agent_id"] = agent_id
-                
-            # Override memory extraction prompt based on detected agent type
-            # detected_agent_type = detect_agent_type_from_metadata(metadata)
-            # agent_prompt = get_memory_extraction_prompt(detected_agent_type)
-            
-            # Temporarily override the memory client's extraction prompt
-            # original_prompt = getattr(memory_client.config, 'custom_fact_extraction_prompt', None)
-            # memory_client.config.custom_fact_extraction_prompt = agent_prompt
-            
-            # print(f"[DEBUG] Using {detected_agent_type} extraction prompt")
-            # logging.info(f"Agent type detected: {detected_agent_type}")
-                
-            # Use user_id (and optionally agent_id) for memory client operations
-            # Note: text is passed as first positional argument, not as keyword
-            response = memory_client.add(text, **add_params)
-            
-            # Restore original prompt
-            # if original_prompt:
-            #     memory_client.config.custom_fact_extraction_prompt = original_prompt
-            
-            print(f"[DEBUG] memory_client.add response: {response}")
-            logging.info(f"Memory client response: {response}")
-
-            # Persist DB changes
-            if isinstance(response, dict) and 'results' in response:
-                print(f"[DEBUG] Processing {len(response['results'])} results from memory_client")
-                for result in response['results']:
-                    print(f"[DEBUG] Processing result: {result}")
-                    mem_id = uuid.UUID(result['id'])
-                    memory = db.query(Memory).filter(Memory.id == mem_id).first()
-                    if result['event'] == 'ADD':
-                        print(f"[DEBUG] ADD event - storing metadata: {metadata}")
-                        logging.info(f"Storing metadata in database: {metadata}")
-                        if not memory:
-                            memory = Memory(
-                                id=mem_id,
-                                user_id=user.id,
-                                app_id=app.id,
-                                content=result['memory'],
-                                state=MemoryState.active,
-                                metadata_=metadata
-                            )
-                            db.add(memory)
-                            print(f"[DEBUG] Created new memory with metadata: {metadata}")
-                        else:
-                            memory.state = MemoryState.active
-                            memory.content = result['memory']
-                            memory.metadata_ = metadata
-                            print(f"[DEBUG] Updated existing memory with metadata: {metadata}")
-                        history = MemoryStatusHistory(
-                            memory_id=mem_id,
-                            changed_by=user.id,
-                            old_state=(MemoryState.deleted if memory else None),
-                            new_state=MemoryState.active
-                        )
-                        db.add(history)
-                    elif result['event'] == 'DELETE':
-                        if memory:
-                            memory.state = MemoryState.deleted
-                            memory.deleted_at = datetime.datetime.now(datetime.timezone.utc)
-                            history = MemoryStatusHistory(
-                                memory_id=mem_id,
-                                changed_by=user.id,
-                                old_state=MemoryState.active,
-                                new_state=MemoryState.deleted
-                            )
-                            db.add(history)
-                db.commit()
-            
-            # Return JSON string representation of the response
-            return json.dumps(response, indent=2)
-        finally:
-            db.close()
+        # Schedule background task and return immediately
+        asyncio.create_task(
+            _process_add_memories(
+                text=text,
+                full_meta=full_meta,
+                agent_id=agent_id,
+                user_id=user_id,
+                client_name=client_name,
+                original_metadata=metadata,
+            )
+        )
+        return json.dumps({"status":"accepted"}, separators=(",", ":"))
     except Exception as e:
-        logging.exception(f"Error adding to memory: {e}")
-        return f"Error adding to memory: {e}"
+        logging.exception(f"Error scheduling background add_memories: {e}")
+        return f"Error scheduling add_memories: {e}"
 
 
 @mcp.tool(description="Search through stored memories. This method is called EVERYTIME the user asks anything.")
@@ -239,7 +246,7 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
     if not client_name:
         return "Error: client_name not provided"
 
-    logging.info(f"search_memory called with query='{query}', user_id={user_id}, collection_name={collection_name}, agent_id={agent_id}")
+    logging.debug(f"search_memory called with query length={len(query)}, user_id={user_id}, collection_name={collection_name}, agent_id={agent_id}")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
@@ -272,14 +279,21 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
                 conditions.append(qdrant_models.HasIdCondition(has_id=accessible_memory_ids_str))
 
             filters = qdrant_models.Filter(must=conditions)
-            embeddings = memory_client.embedding_model.embed(query, "search")
+            # Offload potentially blocking embedding call
+            embed_start = time.perf_counter()
+            embeddings = await asyncio.to_thread(memory_client.embedding_model.embed, query, "search")
+            logging.debug(f"embedding_model.embed completed in {time.perf_counter() - embed_start:.3f}s")
             
-            hits = memory_client.vector_store.client.query_points(
+            # Offload vector store query
+            query_start = time.perf_counter()
+            hits = await asyncio.to_thread(
+                memory_client.vector_store.client.query_points,
                 collection_name=memory_client.vector_store.collection_name,
                 query=embeddings,
                 query_filter=filters,
                 limit=10,
             )
+            logging.debug(f"vector_store.query_points completed in {time.perf_counter() - query_start:.3f}s")
 
             # Process search results
             memories = hits.points
@@ -336,8 +350,9 @@ async def search_memory(query: str, metadata: Any = None, agent_id: Optional[str
                     db.add(access_log)
                 db.commit()
             
-            logging.info(f"Search returned {len(memories)} memories for collection '{collection_name}' and user '{user_id}'")
-            return json.dumps(memories, indent=2)
+            logging.debug(f"Search returned {len(memories)} memories for collection '{collection_name}' and user '{user_id}'")
+            # Return compact JSON string to avoid multi-line SSE payloads
+            return json.dumps(memories, separators=(",", ":"))
         finally:
             db.close()
     except Exception as e:
@@ -364,7 +379,7 @@ async def list_memories(metadata: Any = None, agent_id: Optional[str] = None) ->
     if not client_name:
         return "Error: client_name not provided"
 
-    logging.info(f"list_memories called with user_id={user_id}, collection_name={collection_name}, agent_id={agent_id}")
+    logging.debug(f"list_memories called with user_id={user_id}, collection_name={collection_name}, agent_id={agent_id}")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
@@ -386,7 +401,10 @@ async def list_memories(metadata: Any = None, agent_id: Optional[str] = None) ->
                 get_all_params["agent_id"] = agent_id
 
             # Get all memories
-            memories = memory_client.get_all(**get_all_params)
+            # Offload blocking get_all
+            get_all_start = time.perf_counter()
+            memories = await asyncio.to_thread(memory_client.get_all, **get_all_params)
+            logging.debug(f"memory_client.get_all completed in {time.perf_counter() - get_all_start:.3f}s")
             filtered_memories = []
 
             # Filter memories based on permissions
@@ -431,8 +449,9 @@ async def list_memories(metadata: Any = None, agent_id: Optional[str] = None) ->
                         filtered_memories.append(memory)
                 db.commit()
             
-            logging.info(f"Listed {len(filtered_memories)} memories for collection '{collection_name}' and user '{user_id}'")
-            return json.dumps(filtered_memories, indent=2)
+            logging.debug(f"Listed {len(filtered_memories)} memories for collection '{collection_name}' and user '{user_id}'")
+            # Return compact JSON string to avoid multi-line SSE payloads
+            return json.dumps(filtered_memories, separators=(",", ":"))
         finally:
             db.close()
     except Exception as e:
@@ -450,7 +469,7 @@ async def delete_all_memories(metadata: Any = None, agent_id: Optional[str] = No
     if not client_name:
         return "Error: client_name not provided"
 
-    logging.info(f"delete_all_memories called with user_id={user_id}, agent_id={agent_id}")
+    logging.debug(f"delete_all_memories called with user_id={user_id}, agent_id={agent_id}")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
@@ -536,20 +555,27 @@ async def handle_sse(request: Request):
 
     try:
         # Handle SSE connection
+        logging.debug(f"Opening SSE connection for user_id={uid}, client_name={client_name}")
         async with sse.connect_sse(
             request.scope,
             request.receive,
             request._send,
         ) as (read_stream, write_stream):
-            await mcp._mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp._mcp_server.create_initialization_options(),
-            )
+            logging.debug("SSE connected; starting MCP server run")
+            run_start = time.perf_counter()
+            try:
+                await mcp._mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    mcp._mcp_server.create_initialization_options(),
+                )
+            finally:
+                logging.debug(f"MCP server run finished in {time.perf_counter() - run_start:.3f}s")
     finally:
         # Clean up context variables
         user_id_var.reset(user_token)
         client_name_var.reset(client_token)
+        logging.debug(f"Closed SSE connection for user_id={uid}, client_name={client_name}")
 
 
 @mcp_router.head("/{client_name}/sse/{user_id}")
@@ -572,6 +598,10 @@ async def handle_post_message(request: Request):
     """Handle POST messages for SSE"""
     try:
         body = await request.body()
+        headers = dict(request.headers)
+        logging.debug(
+            f"Received SSE POST message: path={request.url.path}, content_length={len(body)}, content_type={headers.get('content-type')}"
+        )
 
         # Create a simple receive function that returns the body
         async def receive():
@@ -582,10 +612,15 @@ async def handle_post_message(request: Request):
             return {}
 
         # Call handle_post_message with the correct arguments
+        post_start = time.perf_counter()
         await sse.handle_post_message(request.scope, receive, send)
+        logging.debug(f"sse.handle_post_message completed in {time.perf_counter() - post_start:.3f}s")
 
         # Return a success response
         return {"status": "ok"}
+    except Exception as e:
+        logging.exception(f"Error handling SSE POST message: {e}")
+        return {"status": "error", "detail": str(e)}
     finally:
         pass
         # Clean up context variable
